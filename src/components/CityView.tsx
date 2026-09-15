@@ -1,13 +1,19 @@
 import { WebView } from 'react-native-webview';
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { View } from 'react-native';
 import { cityDocument, type CityViewProps } from './cityDocument';
+import { CityMarkerPreview, type CityMarkerPreviewHandle } from './CityMarkerPreview';
 import { formatServiceLocation } from '../data/services';
 
 export const CityView = ({ service, reveal, reducedMotion, onReady, onError }: CityViewProps) => {
   const view = useRef<WebView>(null);
+  const preview = useRef<CityMarkerPreviewHandle>(null);
   const html = useMemo(() => cityDocument(service, reducedMotion), [service, reducedMotion]);
+  const updatePreview = useCallback((expanded: boolean, restoreFocus = false) => {
+    view.current?.injectJavaScript(`window.setCityPreviewState?.(${expanded},${restoreFocus});true;`);
+  }, []);
   useEffect(() => { if (reveal) view.current?.injectJavaScript(`window.revealCity?.();true;`); }, [reveal]);
-  return <WebView
+  return <View style={{ flex: 1 }}><WebView
     ref={view}
     accessibilityLabel={`Explore ${formatServiceLocation(service)} in 3D`}
     source={{ html }}
@@ -26,8 +32,9 @@ export const CityView = ({ service, reveal, reducedMotion, onReady, onError }: C
           if (reveal) view.current?.injectJavaScript(`window.revealCity?.();true;`);
         }
         if (message.type === `error`) onError();
+        preview.current?.receive(message);
       } catch { onError(); }
     }}
     style={{ flex: 1, backgroundColor: `#06101b` }}
-  />;
+  /><CityMarkerPreview ref={preview} service={service} enabled={reveal} reducedMotion={reducedMotion} onVisibilityChange={updatePreview} /></View>;
 };

@@ -1,9 +1,12 @@
-import { useMemo } from 'react';
-import { useThree } from '@react-three/fiber';
+import { useMemo, useRef, type RefObject } from 'react';
+import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
+import { type LaunchMotion } from '../config/launchMotion';
 
 type SpaceBackdropProps = {
   compact: boolean;
+  launchMotion: RefObject<LaunchMotion>;
+  reducedMotion: boolean;
 };
 
 const starVertex = `
@@ -50,6 +53,7 @@ const moonVertex = `
 
 const moonFragment = `
   uniform vec4 craters[14];
+  uniform float moonOpacity;
   varying vec3 vPosition;
   varying vec3 vNormal;
 
@@ -100,15 +104,16 @@ const moonFragment = `
     // A trace of earthshine keeps the unlit limb legible without a halo.
     vec3 color = vec3(0.85, 0.86, 0.87) * albedo * (0.018 + diffuse * 0.92);
     color += vec3(0.013, 0.020, 0.032) * (1.0 - smoothstep(-0.1, 0.22, light));
-    gl_FragColor = vec4(color, 1.0);
+    gl_FragColor = vec4(color, moonOpacity);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
   }
 `;
 
-export const SpaceBackdrop = ({ compact }: SpaceBackdropProps) => {
+export const SpaceBackdrop = ({ compact, launchMotion, reducedMotion }: SpaceBackdropProps) => {
   const { width, height } = useThree(state => state.size);
   const pixelRatio = useThree(state => state.viewport.dpr);
+  const moonMaterial = useRef<THREE.ShaderMaterial>(null);
   const stars = useMemo(() => {
     const count = compact ? 165 : 360;
     const positions = new Float32Array(count * 3);
@@ -134,6 +139,7 @@ export const SpaceBackdrop = ({ compact }: SpaceBackdropProps) => {
   const moonUniforms = useMemo(() => {
     const diameter = compact ? THREE.MathUtils.clamp(width * 0.065, 20, 28) : 47;
     return {
+      moonOpacity: { value: 0 },
       screenScale: { value: new THREE.Vector2(diameter / width, diameter / height) },
       anchor: { value: new THREE.Vector2(compact ? -0.80 : 0.74, compact ? 0.56 : 0.36) },
       craters: { value: [
@@ -155,6 +161,14 @@ export const SpaceBackdrop = ({ compact }: SpaceBackdropProps) => {
     };
   }, [compact, width, height]);
 
+  useFrame(() => {
+    if (!moonMaterial.current) return;
+    // Follow the shared loader progress so the moon stays visible after entry.
+    moonMaterial.current.uniforms.moonOpacity.value = reducedMotion
+      ? 1
+      : THREE.MathUtils.smoothstep(launchMotion.current.fill, 0.08, 0.82);
+  });
+
   return <>
     <points name="space-stars" frustumCulled={false} renderOrder={-20}>
       <bufferGeometry>
@@ -168,8 +182,8 @@ export const SpaceBackdrop = ({ compact }: SpaceBackdropProps) => {
     </points>
     <mesh name="distant-moon" frustumCulled={false} renderOrder={-10}>
       <sphereGeometry args={[1, 48, 32]} />
-      <shaderMaterial vertexShader={moonVertex} fragmentShader={moonFragment}
-        uniforms={moonUniforms} />
+      <shaderMaterial ref={moonMaterial} vertexShader={moonVertex} fragmentShader={moonFragment}
+        uniforms={moonUniforms} transparent depthWrite={false} />
     </mesh>
   </>;
 };

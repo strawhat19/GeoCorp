@@ -1,7 +1,8 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { Animated, Easing, Image, Platform, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions, type GestureResponderEvent, type ImageSourcePropType } from 'react-native';
+import { Animated, Easing, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions, type GestureResponderEvent } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { GlobeTooltipPortal } from './GlobeTooltipPortal';
+import { ServicePreviewCard, servicePreviewCardStyle } from './ServicePreviewCard';
 import { GLOBE_PULSE_COLOR, serviceMarkerContent } from '../config/globeMarkers';
 import { services, formatServiceLocation, type Service } from '../data/services';
 
@@ -179,13 +180,6 @@ const LocationMarker = forwardRef<MarkerHandle, MarkerProps>(
   },
 );
 LocationMarker.displayName = `LocationMarker`;
-
-const PreviewImage = ({ source, alt }: { source: ImageSourcePropType; alt: string }) => {
-  const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [source]);
-  if (failed) return null;
-  return <Image source={source} accessibilityLabel={alt} resizeMode="cover" onError={() => setFailed(true)} style={styles.previewImage} />;
-};
 
 /** Camera projections update positions directly; React only handles visibility and preview ownership. */
 export const GlobeMarkers = forwardRef<GlobeMarkersHandle, GlobeMarkersProps>((props, ref) => {
@@ -408,7 +402,6 @@ export const GlobeMarkers = forwardRef<GlobeMarkersHandle, GlobeMarkersProps>((p
     propsRef.current.onSelect(destination);
   }, [dismissPreview, nearestService]);
 
-  const content = preview ? serviceMarkerContent[preview.id] : null;
   return (
     <View ref={overlay} pointerEvents="box-none" onLayout={measureViewport} style={styles.overlay}>
       {services.map((service, index) => (
@@ -442,21 +435,9 @@ export const GlobeMarkers = forwardRef<GlobeMarkersHandle, GlobeMarkersProps>((p
               onFocus={() => { cardFocused.current = true; clearExit(); }}
               onBlur={() => { cardFocused.current = false; scheduleExit(); }}
               onLayout={event => { cardHeight.current = event.nativeEvent.layout.height; placeCard(); }}
-              style={[styles.preview, { maxHeight: cardSize.maxHeight }]}
+              style={[servicePreviewCardStyle, { maxHeight: cardSize.maxHeight }]}
             >
-              <ScrollView bounces={false} showsVerticalScrollIndicator={false} style={{ maxHeight: cardSize.maxHeight }}>
-                {content?.image && <PreviewImage key={preview.id} source={content.image} alt={content.imageAlt ?? `${preview.name} in ${formatServiceLocation(preview)}`} />}
-                <View style={styles.previewBody}>
-                  <View style={styles.previewEyebrow}>
-                    <View style={[styles.serviceSwatch, { backgroundColor: preview.color }]} />
-                    <Text style={styles.previewKicker}>SERVICE {preview.number}</Text>
-                  </View>
-                  <Text style={styles.previewTitle}>{preview.name}</Text>
-                  <Text style={styles.previewLocation}>{preview.city} <Text style={styles.locationSeparator}>/</Text> {preview.region}</Text>
-                  <Text nativeID={`globe-preview-description-${preview.id}`} style={styles.previewDescription}>{content?.description ?? preview.description}</Text>
-                  <View style={styles.disciplines}>
-                    {preview.disciplines.map(discipline => <Text key={discipline} style={styles.discipline}>{discipline}</Text>)}
-                  </View>
+              <ServicePreviewCard service={preview} maxHeight={cardSize.maxHeight} descriptionID={`globe-preview-description-${preview.id}`}>
                   <Pressable
                     testID="globe-preview-city-cta"
                     accessibilityRole="button"
@@ -484,8 +465,7 @@ export const GlobeMarkers = forwardRef<GlobeMarkersHandle, GlobeMarkersProps>((p
                     <Text style={styles.previewActionText}>Explore {preview.city}</Text>
                     <Text accessible={false} style={styles.previewActionArrow}>↗</Text>
                   </Pressable>
-                </View>
-              </ScrollView>
+              </ServicePreviewCard>
             </Pressable>
           </Animated.View>
         </Animated.View>
@@ -507,18 +487,6 @@ const styles = StyleSheet.create({
   glow: { position: `absolute`, width: 16, height: 16, borderRadius: 8, opacity: 0.18 },
   core: { width: 8, height: 8, borderRadius: 4, borderWidth: 1.5, borderColor: `#F4FBFF` },
   previewPosition: { position: `absolute`, top: 0, left: 0, zIndex: 10 },
-  preview: { cursor: `auto`, borderRadius: 20, overflow: `hidden`, borderWidth: 1, borderColor: `rgba(186,221,239,0.24)`, backgroundColor: `rgba(8,21,33,0.98)`, boxShadow: `0 20px 60px rgba(0,0,0,0.35)` },
-  previewImage: { width: `100%`, height: 138, backgroundColor: `#142D40` },
-  previewBody: { padding: 20 },
-  previewEyebrow: { flexDirection: `row`, alignItems: `center`, gap: 7, marginBottom: 9 },
-  serviceSwatch: { width: 5, height: 5, borderRadius: 3 },
-  previewKicker: { color: `#94ADBC`, fontFamily: `Manrope_600SemiBold`, fontSize: 9, lineHeight: 14, letterSpacing: 1.9 },
-  previewTitle: { color: `#F1F7FA`, fontFamily: `Manrope_600SemiBold`, fontSize: 21, lineHeight: 28, letterSpacing: -0.5 },
-  previewLocation: { color: `#B5CBD7`, fontFamily: `Manrope_500Medium`, fontSize: 11, lineHeight: 18, marginTop: 4 },
-  locationSeparator: { color: `#597B90` },
-  previewDescription: { color: `#B8C9D4`, fontFamily: `Manrope_400Regular`, fontSize: 12, lineHeight: 19, marginTop: 15 },
-  disciplines: { flexDirection: `row`, flexWrap: `wrap`, gap: 6, marginTop: 14 },
-  discipline: { color: `#C0D4DF`, fontFamily: `Manrope_500Medium`, fontSize: 9, lineHeight: 14, borderWidth: 1, borderColor: `rgba(158,197,218,0.17)`, borderRadius: 7, paddingHorizontal: 8, paddingVertical: 4 },
   previewAction: { minHeight: 43, flexDirection: `row`, justifyContent: `space-between`, alignItems: `center`, borderRadius: 10, borderWidth: 1, borderColor: `rgba(157,218,242,0.25)`, backgroundColor: `rgba(131,204,234,0.08)`, paddingHorizontal: 12, marginTop: 18 },
   previewActionHighlighted: { backgroundColor: `rgba(131,204,234,0.18)`, borderColor: `rgba(157,218,242,0.65)` },
   previewActionPressed: { opacity: 0.72 },

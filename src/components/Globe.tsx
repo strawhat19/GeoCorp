@@ -3,18 +3,24 @@ import { Asset } from 'expo-asset';
 import { useFrame } from '@react-three/fiber';
 import { Canvas, useLoader } from './GlobeCanvas';
 import { SpaceBackdrop } from './SpaceBackdrop';
+import { globeVertex, surfaceFragment, cloudsFragment, atmosphereFragment } from './earthShaders';
 import { GlobeMarkers, type GlobeMarkersHandle, type MarkerProjection } from './GlobeMarkers';
 import { services, formatServiceLocation, type Service } from '../data/services';
+import { type LaunchMotion } from '../config/launchMotion';
 import { Component, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { PanResponder, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 
 type GlobeProps = {
   paused: boolean;
   compact: boolean;
+  viewportHeight: number;
   suspended: boolean;
   reducedMotion: boolean;
   selected: Service | null;
   scrollMotion: React.RefObject<{ progress: number; velocity: number; updatedAt: number }>;
+  launchMotion: React.RefObject<LaunchMotion>;
+  loaderLayout: { diameter: number; centerY: number };
+  onTextureProgress: (progress: number) => void;
   onArrival: () => void;
   onSelect: (service: Service) => void;
   onInteract: () => void;
@@ -27,80 +33,6 @@ const dayAsset = require(`../../assets/earth/earth_day_4096.jpg`);
 const nightAsset = require(`../../assets/earth/earth_night_4096.jpg`);
 const detailAsset = require(`../../assets/earth/earth_bump_roughness_clouds_4096.jpg`);
 const textureSources = [dayAsset, nightAsset, detailAsset].map(source => Platform.OS === `web` ? Asset.fromModule(source).uri : source);
-const globeVertex = `
-  varying vec2 vUv;
-  varying vec3 vNormal;
-  varying vec3 vPosition;
-  void main() {
-    vUv = uv;
-    vNormal = normalize(mat3(modelMatrix) * normal);
-    vPosition = (modelMatrix * vec4(position, 1.0)).xyz;
-    gl_Position = projectionMatrix * viewMatrix * vec4(vPosition, 1.0);
-  }
-`;
-
-const surfaceFragment = `
-  uniform sampler2D dayMap;
-  uniform sampler2D nightMap;
-  uniform sampler2D detailMap;
-  uniform vec3 sunDirection;
-  varying vec2 vUv;
-  varying vec3 vNormal;
-  varying vec3 vPosition;
-  void main() {
-    vec3 detail = texture2D(detailMap, vUv).rgb;
-    float heightX = texture2D(detailMap, vUv + vec2(0.0005, 0.0)).r - detail.r;
-    float heightY = texture2D(detailMap, vUv + vec2(0.0, 0.0005)).r - detail.r;
-    vec3 tangent = normalize(vec3(-vNormal.z, 0.0, vNormal.x));
-    vec3 bitangent = normalize(cross(vNormal, tangent));
-    vec3 normal = normalize(vNormal + tangent * heightX * 1.8 + bitangent * heightY * 1.8);
-    vec3 viewDirection = normalize(cameraPosition - vPosition);
-    float light = dot(normal, sunDirection);
-    float daylight = smoothstep(-0.16, 0.22, light);
-    vec3 day = texture2D(dayMap, vUv).rgb;
-    vec3 night = texture2D(nightMap, vUv).rgb;
-    float diffuse = max(light, 0.0) * 1.15 + 0.11;
-    vec3 color = day * diffuse * mix(0.035, 1.0, daylight);
-    color += night * (1.0 - smoothstep(-0.24, 0.18, light)) * 1.4;
-    float specular = pow(max(dot(normal, normalize(sunDirection + viewDirection)), 0.0), 70.0);
-    color += vec3(0.6, 0.82, 1.0) * specular * (1.0 - detail.g) * 0.45;
-    float fresnel = pow(1.0 - max(dot(normal, viewDirection), 0.0), 3.5);
-    color += vec3(0.10, 0.36, 0.63) * fresnel * daylight * 0.48;
-    gl_FragColor = vec4(color, 1.0);
-    #include <tonemapping_fragment>
-    #include <colorspace_fragment>
-  }
-`;
-
-const cloudsFragment = `
-  uniform sampler2D detailMap;
-  uniform vec3 sunDirection;
-  varying vec2 vUv;
-  varying vec3 vNormal;
-  varying vec3 vPosition;
-  void main() {
-    float cloud = smoothstep(0.22, 0.95, texture2D(detailMap, vUv).b);
-    float light = dot(normalize(vNormal), sunDirection);
-    float brightness = max(light, 0.0) * 0.9 + 0.16;
-    gl_FragColor = vec4(vec3(0.87, 0.94, 1.0) * brightness, cloud * 0.85);
-    #include <tonemapping_fragment>
-    #include <colorspace_fragment>
-  }
-`;
-
-const atmosphereFragment = `
-  uniform vec3 sunDirection;
-  varying vec2 vUv;
-  varying vec3 vNormal;
-  varying vec3 vPosition;
-  void main() {
-    vec3 viewDirection = normalize(cameraPosition - vPosition);
-    float rim = pow(1.0 - abs(dot(normalize(vNormal), viewDirection)), 4.5);
-    float daylight = smoothstep(-0.45, 0.8, dot(normalize(vNormal), sunDirection));
-    gl_FragColor = vec4(vec3(0.12, 0.48, 0.9), rim * daylight * 0.52);
-  }
-`;
-
 export const latLngToVector = (latitude: number, longitude: number, radius = 1) => {
   const phi = THREE.MathUtils.degToRad(latitude);
   const theta = THREE.MathUtils.degToRad(longitude);
@@ -114,6 +46,47 @@ type SceneProps = GlobeProps & {
 };
 
 type ScrollSpring = { value: number; velocity: number };
+
+type EarthUniforms = {
+  dayMap: { value: THREE.Texture };
+  nightMap: { value: THREE.Texture };
+  detailMap: { value: THREE.Texture };
+  sunDirection: { value: THREE.Vector3 };
+  fillProgress: { value: number };
+  launchMix: { value: number };
+  liquidTime: { value: number };
+  texturesReady: { value: number };
+};
+
+// Suspend only texture acquisition: the very same sphere is already visible as
+// glass and liquid while these resources load, then receives its Earth maps.
+const EarthTextures = ({ uniforms, onConfigured, onProgress }: {
+  uniforms: EarthUniforms;
+  onConfigured: () => void;
+  onProgress: (progress: number) => void;
+}) => {
+  const textures = useLoader(THREE.TextureLoader, textureSources, loader => {
+    const manager = new THREE.LoadingManager();
+    manager.onProgress = (_url, loaded, total) => onProgress(loaded / Math.max(textureSources.length, total));
+    loader.manager = manager;
+  });
+
+  useEffect(() => {
+    textures.forEach((texture, index) => {
+      texture.colorSpace = index < 2 ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+      texture.anisotropy = 4;
+      texture.needsUpdate = true;
+    });
+    uniforms.dayMap.value = textures[0];
+    uniforms.nightMap.value = textures[1];
+    uniforms.detailMap.value = textures[2];
+    uniforms.texturesReady.value = 1;
+    onConfigured();
+    onProgress(1);
+  }, [textures, uniforms, onConfigured, onProgress]);
+
+  return null;
+};
 
 const advanceScrollSpring = (spring: ScrollSpring, target: number, delta: number) => {
   // Exact critically damped motion keeps velocity continuous when wheel/touch
@@ -130,8 +103,7 @@ const advanceScrollSpring = (spring: ScrollSpring, target: number, delta: number
   }
 };
 
-const EarthScene = ({ selected, paused, compact, reducedMotion, scrollMotion, drag, dragging, onReady, onArrival, onProjectMarkers }: SceneProps) => {
-  const textures = useLoader(THREE.TextureLoader, textureSources);
+const EarthScene = ({ selected, paused, compact, viewportHeight, reducedMotion, scrollMotion, launchMotion, loaderLayout, onTextureProgress, drag, dragging, onReady, onArrival, onProjectMarkers }: SceneProps) => {
   const clouds = useRef<THREE.Mesh>(null);
   const sunDirection = useMemo(() => new THREE.Vector3(), []);
   const targetDirection = useMemo(() => new THREE.Vector3(), []);
@@ -151,18 +123,29 @@ const EarthScene = ({ selected, paused, compact, reducedMotion, scrollMotion, dr
   const right = useMemo(() => new THREE.Vector3(), []);
   const transition = useRef({ progress: 1, from: currentDirection.current.clone(), ...renderedPresentation.current });
   const markerPositions = useMemo(() => services.map(service => ({ id: service.id, position: latLngToVector(service.latitude, service.longitude, 1.013), projected: new THREE.Vector3() })), []);
-  const surfaceUniforms = useMemo(() => ({ dayMap: { value: textures[0] }, nightMap: { value: textures[1] }, detailMap: { value: textures[2] }, sunDirection: { value: sunDirection } }), [textures, sunDirection]);
-  const shellUniforms = useMemo(() => ({ detailMap: { value: textures[2] }, sunDirection: { value: sunDirection } }), [textures, sunDirection]);
-  const atmosphereUniforms = useMemo(() => ({ sunDirection: { value: sunDirection } }), [sunDirection]);
+  const placeholder = useMemo(() => {
+    const texture = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
+    texture.needsUpdate = true;
+    return texture;
+  }, []);
+  const uniforms = useMemo<EarthUniforms>(() => ({
+    dayMap: { value: placeholder }, nightMap: { value: placeholder }, detailMap: { value: placeholder },
+    sunDirection: { value: sunDirection }, fillProgress: { value: 0 }, launchMix: { value: 1 },
+    liquidTime: { value: 0 }, texturesReady: { value: 0 },
+  }), [placeholder, sunDirection]);
+  // R3F copies declarative uniform entries. Owning these materials preserves
+  // the shared live values used by resource loading and the animation frames.
+  const materials = useMemo(() => ({
+    surface: new THREE.ShaderMaterial({ vertexShader: globeVertex, fragmentShader: surfaceFragment, uniforms }),
+    clouds: new THREE.ShaderMaterial({ vertexShader: globeVertex, fragmentShader: cloudsFragment, uniforms, transparent: true, depthWrite: false }),
+    atmosphere: new THREE.ShaderMaterial({ vertexShader: globeVertex, fragmentShader: atmosphereFragment, uniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.BackSide }),
+  }), [uniforms]);
+  const onTexturesConfigured = useCallback(() => { texturesConfigured.current = true; }, []);
 
-  useEffect(() => {
-    textures.forEach((texture, index) => {
-      texture.colorSpace = index < 2 ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-      texture.anisotropy = 4;
-      texture.needsUpdate = true;
-    });
-    texturesConfigured.current = true;
-  }, [textures]);
+  useEffect(() => () => {
+    placeholder.dispose();
+    Object.values(materials).forEach(material => material.dispose());
+  }, [placeholder, materials]);
 
   useLayoutEffect(() => {
     // An initial orbit is already correctly framed; only destination changes fly.
@@ -187,6 +170,10 @@ const EarthScene = ({ selected, paused, compact, reducedMotion, scrollMotion, dr
       onReady();
     }
     const delta = Math.min(frameDelta, 0.05);
+    const launch = launchMotion.current;
+    uniforms.fillProgress.value = launch.fill;
+    uniforms.launchMix.value = 1 - launch.reveal;
+    if (!reducedMotion) uniforms.liquidTime.value += delta;
     const flight = transition.current;
     const inFlight = flight.progress < 1;
     flight.progress = reducedMotion ? 1 : Math.min(1, flight.progress + delta / (selected ? 2.2 : 2.8));
@@ -195,14 +182,16 @@ const EarthScene = ({ selected, paused, compact, reducedMotion, scrollMotion, dr
     const restingDistance = selected ? 2.2 : (compact ? 3.15 : 2.55);
     const restingHorizon = selected ? 0 : compact ? 0.66 : 0.68;
     const motion = scrollMotion.current;
-    const scrollTarget = selected ? 0 : THREE.MathUtils.clamp(motion.progress, 0, 1);
+    const scrollTarget = selected ? 0 : THREE.MathUtils.clamp(motion.progress, 0, 5);
     if (reducedMotion) presentationMotion.current = { value: scrollTarget, velocity: 0 };
     else advanceScrollSpring(presentationMotion.current, scrollTarget, delta);
-    const progress = THREE.MathUtils.clamp(presentationMotion.current.value, 0, 1);
-    const presentation = progress * progress * (3 - 2 * progress);
+    const progress = THREE.MathUtils.clamp(presentationMotion.current.value, 0, 5);
+    const leg = Math.min(4, Math.floor(progress));
+    const legProgress = progress - leg;
+    const presentation = legProgress * legProgress * (3 - 2 * legProgress);
     // Rotation follows the visible journey, including its gentle settling.
     // The spring's continuous velocity avoids spikes from individual events.
-    const presentationSpeed = Math.abs(6 * progress * (1 - progress) * presentationMotion.current.velocity);
+    const presentationSpeed = Math.abs(6 * legProgress * (1 - legProgress) * presentationMotion.current.velocity);
     const orbitSpeed = 0.027 + Math.min(0.65, presentationSpeed * 0.42);
     targetDirection.copy(latLngToVector(selected?.latitude ?? 20, selected?.longitude ?? -100));
     if (inFlight) {
@@ -242,19 +231,40 @@ const EarthScene = ({ selected, paused, compact, reducedMotion, scrollMotion, dr
     let horizon = currentHorizon.current;
     let horizontal = currentHorizontal.current;
     if (camera instanceof THREE.PerspectiveCamera && size.width && size.height) {
-      const targetDiameter = compact ? size.width * 0.56 : Math.min(size.width * 0.45, size.height * 0.68);
+      const targetDiameter = compact ? size.width * 0.56 : Math.min(size.width * 0.45, viewportHeight * 0.68);
       // A sphere's silhouette subtends asin(radius / distance), so retain an
       // exact apparent diameter across viewport aspect ratios and breakpoints.
       // Interpolate the visible size rather than camera distance: otherwise a
       // large mobile Earth collapses too quickly at the start of the journey.
-      if (presentation > 0) {
+      if (progress > 0) {
         const focalHeight = size.height / Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
         const initialDiameter = focalHeight / Math.sqrt(distance * distance - 1);
-        const diameter = THREE.MathUtils.lerp(initialDiameter, targetDiameter, presentation);
+        const footerDiameter = initialDiameter * 0.94;
+        const finalDiameter = initialDiameter * 1.03;
+        const diameters = [initialDiameter, targetDiameter, targetDiameter * (compact ? 1 : 1.08), targetDiameter, footerDiameter, finalDiameter];
+        const diameter = THREE.MathUtils.lerp(diameters[leg], diameters[leg + 1], presentation);
         distance = Math.sqrt(1 + (focalHeight / diameter) ** 2);
+        const storyHorizon = compact ? viewportHeight * 0.17 / size.height - 0.5 : -0.04;
+        // At the end the planet's lower edge reaches 26% of the screen. This
+        // mirrors the opening horizon while leaving room for the footer.
+        const finalHorizon = (viewportHeight * 0.26 - finalDiameter / 2) / size.height - 0.5;
+        const footerHorizon = (viewportHeight * 0.2 - footerDiameter / 2) / size.height - 0.5;
+        const horizons = [horizon, storyHorizon, storyHorizon, storyHorizon, footerHorizon, finalHorizon];
+        const side = compact ? 0.18 : 0.26;
+        const horizontals = [horizontal, side, -side, side, -0.04, 0];
+        horizon = THREE.MathUtils.lerp(horizons[leg], horizons[leg + 1], presentation);
+        horizontal = THREE.MathUtils.lerp(horizontals[leg], horizontals[leg + 1], presentation);
       }
-      horizon = THREE.MathUtils.lerp(horizon, compact ? -0.26 : 0, presentation);
-      horizontal = THREE.MathUtils.lerp(horizontal, compact ? 0.28 : 0.26, presentation);
+      // Animate this camera from the loader's glass Earth to the opening
+      // horizon. No canvas, mesh, texture, or geographic orientation is swapped.
+      if (launch.reveal < 1 && !selected) {
+        const focalHeight = size.height / Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+        const landingDiameter = focalHeight / Math.sqrt(distance * distance - 1);
+        const diameter = THREE.MathUtils.lerp(loaderLayout.diameter, landingDiameter, launch.reveal);
+        distance = Math.sqrt(1 + (focalHeight / diameter) ** 2);
+        horizon = THREE.MathUtils.lerp(loaderLayout.centerY / size.height - 0.5, horizon, launch.reveal);
+        horizontal *= launch.reveal;
+      }
       camera.setViewOffset(size.width, size.height, -size.width * horizontal, -size.height * horizon, size.width, size.height);
     }
     renderedPresentation.current = { distance, horizon, horizontal };
@@ -269,7 +279,7 @@ const EarthScene = ({ selected, paused, compact, reducedMotion, scrollMotion, dr
       const y = (1 - projected.y) * size.height / 2;
       return {
         id, x, y,
-        visible: !selected && flight.progress === 1 && position.dot(camera.position) > position.lengthSq()
+        visible: launch.reveal === 1 && !selected && flight.progress === 1 && position.dot(camera.position) > position.lengthSq()
           && projected.z >= -1 && projected.z <= 1 && x >= 0 && x <= size.width && y >= 0 && y <= size.height,
       };
     }));
@@ -281,28 +291,30 @@ const EarthScene = ({ selected, paused, compact, reducedMotion, scrollMotion, dr
 
   return (
     <>
-      <SpaceBackdrop compact={compact} />
+      <SpaceBackdrop compact={compact} launchMotion={launchMotion} reducedMotion={reducedMotion} />
+      <Suspense fallback={null}><EarthTextures uniforms={uniforms} onConfigured={onTexturesConfigured} onProgress={onTextureProgress} /></Suspense>
       <mesh name="earth-surface" onAfterRender={() => { if (texturesConfigured.current) earthRendered.current = true; }}>
         <sphereGeometry args={[1, compact ? 64 : 128, compact ? 48 : 96]} />
-        <shaderMaterial vertexShader={globeVertex} fragmentShader={surfaceFragment} uniforms={surfaceUniforms} />
+        <primitive object={materials.surface} attach="material" />
       </mesh>
       <mesh name="earth-clouds" ref={clouds}>
         <sphereGeometry args={[1.005, 64, 48]} />
-        <shaderMaterial transparent depthWrite={false} vertexShader={globeVertex} fragmentShader={cloudsFragment} uniforms={shellUniforms} />
+        <primitive object={materials.clouds} attach="material" />
       </mesh>
       <mesh name="earth-atmosphere">
         <sphereGeometry args={[1.027, 64, 48]} />
-        <shaderMaterial transparent depthWrite={false} blending={THREE.AdditiveBlending} side={THREE.BackSide} vertexShader={globeVertex} fragmentShader={atmosphereFragment} uniforms={atmosphereUniforms} />
+        <primitive object={materials.atmosphere} attach="material" />
       </mesh>
     </>
   );
 };
 
-class GlobeBoundary extends Component<{ children: ReactNode; onRetry: () => void; onError: () => void }, { failed: boolean }> {
+class GlobeBoundary extends Component<{ children: ReactNode; showError: boolean; onRetry: () => void; onError: () => void }, { failed: boolean }> {
   state = { failed: false };
   static getDerivedStateFromError() { return { failed: true }; }
   componentDidCatch() { this.props.onError(); }
   render() {
+    if (this.state.failed && !this.props.showError) return null;
     if (this.state.failed) return <View style={styles.loading}><Text style={styles.errorTitle}>The globe couldn’t load</Text><Text style={styles.errorText}>Choose a destination to explore its city.</Text><Pressable onPress={this.props.onRetry} accessibilityRole="button" style={styles.retry}><Text style={styles.loadingText}>RETRY GLOBE ↗</Text></Pressable></View>;
     return this.props.children;
   }
@@ -336,7 +348,7 @@ export const Globe = (props: GlobeProps) => {
 
   return (
     <View style={styles.container} {...responder.panHandlers} accessibilityLabel={props.selected ? `Earth focused on ${formatServiceLocation(props.selected)}` : `Interactive rotating Earth. Drag horizontally to rotate, or choose a city marker`}>
-      <GlobeBoundary key={attempt} onError={() => { markers.current?.hide(); props.onError(); }} onRetry={() => { useLoader.clear(THREE.TextureLoader, textureSources); setAttempt(value => value + 1); }}>
+      <GlobeBoundary key={attempt} showError={props.launchMotion.current.reveal === 1} onError={() => { markers.current?.hide(); props.onError(); }} onRetry={() => { useLoader.clear(THREE.TextureLoader, textureSources); setAttempt(value => value + 1); }}>
         <View style={[styles.canvas, { pointerEvents: `none` }]}>
           <Canvas frameloop={props.suspended ? `never` : `always`} camera={{ fov: 38, near: 0.01, far: 80, position: [0, 0, 2.55] }} dpr={[1, props.compact ? 1.5 : 2]} gl={{ alpha: true, antialias: true, powerPreference: `high-performance` }} style={styles.canvas}>
             <Suspense fallback={null}><EarthScene {...props} paused={props.paused || markerPreviewOpen} drag={drag} dragging={dragging} onProjectMarkers={projectMarkers} /></Suspense>

@@ -4,20 +4,23 @@ import { GlobeStage } from './src/components/GlobeStage';
 import { GlobeTooltipProvider } from './src/components/GlobeTooltipPortal';
 import { CityView } from './src/components/CityView';
 import { WorldLoader } from './src/components/WorldLoader';
+import { GeoBrand, type BrandFrame } from './src/components/GeoBrand';
 import { PerspectiveSection } from './src/components/PerspectiveSection';
+import { ApproachSection, NetworkSection, LandingFooter } from './src/components/LandingSections';
+import { getJourneyProgress } from './src/config/landingMotion';
+import { getLaunchProgress, getLoaderEarthLayout, type LaunchMotion } from './src/config/launchMotion';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { services, formatCoordinates, formatServiceLocation, type Service } from './src/data/services';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFonts, Manrope_400Regular, Manrope_500Medium, Manrope_600SemiBold, Manrope_700Bold, Manrope_800ExtraBold } from '@expo-google-fonts/manrope';
-import { AccessibilityInfo, Animated, AppState, Image, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
+import { AccessibilityInfo, Animated, AppState, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions, type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
 
 const palette = { ink: `#030812`, text: `#F0F4F6`, muted: `#9AAEBD`, cyan: `#8ADDEC` };
 const globeTextShadow = { textShadowColor: `rgba(3,8,18,0.95)`, textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 4 };
-const logo = require(`./assets/brand/01-core-earth.png`);
 
 const useReducedMotion = () => {
-  const [reduced, setReduced] = useState(false);
+  const [reduced, setReduced] = useState(() => Platform.OS === `web` && typeof window !== `undefined` && window.matchMedia(`(prefers-reduced-motion: reduce)`).matches);
   useEffect(() => {
     void AccessibilityInfo.isReduceMotionEnabled().then(setReduced);
     const listener = AccessibilityInfo.addEventListener(`reduceMotionChanged`, setReduced);
@@ -99,7 +102,14 @@ const GeoCorp = () => {
   const mapGeneration = useRef(0);
   const [globeReady, setGlobeReady] = useState(false);
   const [globeError, setGlobeError] = useState(false);
+  const [textureProgress, setTextureProgress] = useState(0);
   const [entered, setEntered] = useState(false);
+  const [brandReady, setBrandReady] = useState(false);
+  const [brandFrame, setBrandFrame] = useState<BrandFrame | null>(null);
+  const rootView = useRef<View>(null);
+  const headerBrand = useRef<View>(null);
+  const launchMotion = useRef<LaunchMotion>({ fill: 0, reveal: 0 });
+  const launchReveal = useRef(new Animated.Value(0)).current;
   const opacity = useRef(new Animated.Value(1)).current;
   const mapOpacity = useRef(new Animated.Value(0)).current;
   const scroll = useRef<ScrollView>(null);
@@ -110,8 +120,42 @@ const GeoCorp = () => {
   const [returningToTop, setReturningToTop] = useState(false);
   const storyWasRevealed = useRef(false);
   const cityVisible = Boolean(selected && arrived && mapReady && !mapError);
-  const pageHeight = Math.max(height - insets.top - insets.bottom, compact ? 800 : 790);
+  const viewportHeight = Math.max(1, height - insets.top - insets.bottom);
+  const pageHeight = Math.max(viewportHeight, compact ? 800 : 790);
+  const loaderLayout = getLoaderEarthLayout(width, height);
+  const [sectionHeights, setSectionHeights] = useState<Record<string, number>>({});
+  const measureSection = (name: string, event: LayoutChangeEvent) => {
+    const sectionHeight = event.nativeEvent.layout.height;
+    setSectionHeights(previous => previous[name] === sectionHeight
+      ? previous : { ...previous, [name]: sectionHeight });
+  };
+  // Layout observers report size changes, not a sibling shifting position.
+  // Accumulating measured heights keeps every later stop correct after reflow.
+  const perspectiveStart = sectionHeights.hero ?? pageHeight;
+  const approachStart = perspectiveStart + (sectionHeights.perspectives ?? pageHeight);
+  const networkStart = approachStart + (sectionHeights.approach ?? pageHeight);
+  const footerStart = networkStart + (sectionHeights.network ?? pageHeight);
+  const journeyEnd = footerStart + (sectionHeights.footer ?? viewportHeight * 1.7) - viewportHeight;
+  const scrollStops = useMemo(() => [0, perspectiveStart, approachStart, networkStart, footerStart, Math.max(footerStart + 1, journeyEnd)], [perspectiveStart, approachStart, networkStart, footerStart, journeyEnd]);
   const [fontsLoaded, fontError] = useFonts({ Manrope_400Regular, Manrope_500Medium, Manrope_600SemiBold, Manrope_700Bold, Manrope_800ExtraBold });
+  const launchProgress = getLaunchProgress(Boolean(fontsLoaded || fontError), textureProgress, globeReady, globeError);
+  const brandTarget = brandFrame ?? { x: compact ? 24 : 56, y: insets.top + (compact ? 18 : 25), width: 168, height: 44 };
+  const onBrandReady = useCallback(() => setBrandReady(true), []);
+  const measureBrand = useCallback(() => {
+    headerBrand.current?.measureInWindow((x, y, brandWidth, brandHeight) => {
+      if (!brandWidth || !brandHeight) return;
+      rootView.current?.measureInWindow((rootX, rootY) => {
+        const next = { x: x - rootX, y: y - rootY, width: brandWidth, height: brandHeight };
+        setBrandFrame(previous => previous && Object.keys(next).every(key => previous[key as keyof BrandFrame] === next[key as keyof BrandFrame]) ? previous : next);
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (entered) return;
+    const frame = requestAnimationFrame(measureBrand);
+    return () => cancelAnimationFrame(frame);
+  }, [width, height, insets.top, fontsLoaded, entered, measureBrand]);
 
   const clearDragPause = useCallback(() => {
     if (dragResumeTimer.current) clearTimeout(dragResumeTimer.current);
@@ -125,24 +169,24 @@ const GeoCorp = () => {
     scroll.current?.scrollTo({ y: 0, animated: !reducedMotion });
   }, [clearDragPause, reducedMotion]);
   const explorePerspectives = useCallback(() => {
-    scroll.current?.scrollTo({ y: pageHeight, animated: !reducedMotion });
-  }, [pageHeight, reducedMotion]);
+    scroll.current?.scrollTo({ y: perspectiveStart, animated: !reducedMotion });
+  }, [perspectiveStart, reducedMotion]);
 
   useEffect(() => () => { if (dragResumeTimer.current) clearTimeout(dragResumeTimer.current); }, []);
 
   useEffect(() => {
-    const progress = Math.min(1, lastScroll.current.y / pageHeight);
+    const progress = getJourneyProgress(lastScroll.current.y, scrollStops);
     scrollMotion.current = { progress, velocity: 0, updatedAt: Date.now() };
     const revealed = !selected && (reducedMotion || progress >= 0.3);
     storyWasRevealed.current = revealed;
     setStoryRevealed(revealed);
-  }, [pageHeight, selected, reducedMotion]);
+  }, [scrollStops, selected, reducedMotion]);
 
   const handleScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const y = Math.max(0, event.nativeEvent.contentOffset.y);
     const now = Date.now();
     const elapsed = Math.min(80, Math.max(16, now - lastScroll.current.time));
-    const progress = Math.min(1, y / pageHeight);
+    const progress = getJourneyProgress(y, scrollStops);
     scrollMotion.current = { progress, velocity: selected ? 0 : (y - lastScroll.current.y) / pageHeight / (elapsed / 1000), updatedAt: now };
     lastScroll.current = { y, time: now };
     if (selected && y <= 1) setReturningToTop(false);
@@ -151,12 +195,13 @@ const GeoCorp = () => {
       storyWasRevealed.current = revealed;
       setStoryRevealed(revealed);
     }
-  }, [pageHeight, reducedMotion, selected]);
+  }, [pageHeight, scrollStops, reducedMotion, selected]);
 
   useEffect(() => {
     const listener = AppState.addEventListener(`change`, state => setActive(state === `active`));
     if (Platform.OS !== `web`) return () => listener.remove();
     const updateVisibility = () => setActive(!document.hidden);
+    updateVisibility();
     document.addEventListener(`visibilitychange`, updateVisibility);
     document.title = `GeoCorp — A World of Possibility`;
     const keydown = (event: KeyboardEvent) => {
@@ -210,22 +255,23 @@ const GeoCorp = () => {
   const onEntered = useCallback(() => setEntered(true), []);
 
   return (
-    <View style={styles.root}>
+    <View ref={rootView} onLayout={measureBrand} style={styles.root}>
       <StatusBar style="light" />
       <Animated.ScrollView ref={scroll} pointerEvents={entered ? `auto` : `none`} accessibilityElementsHidden={!entered} importantForAccessibility={entered ? `auto` : `no-hide-descendants`} aria-hidden={!entered} showsVerticalScrollIndicator={false} scrollEventThrottle={16} onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: Platform.OS !== `web`, listener: handleScroll })} contentContainerStyle={{ paddingTop: insets.top, paddingBottom: insets.bottom }}>
         <View style={[styles.scene, { minHeight: pageHeight }]}>
           <GlobeStage height={pageHeight} scrollY={scrollY}>
-            <Globe selected={selected} paused={dragPaused || !active} compact={compact} reducedMotion={reducedMotion} scrollMotion={scrollMotion} onSelect={selectService} onInteract={pauseOnDrag} onInteractEnd={resumeAfterDrag} onArrival={onArrival} onReady={onGlobeReady} onError={onGlobeError} suspended={!active || cityVisible} />
+            <Globe selected={selected} paused={dragPaused || !active} compact={compact} viewportHeight={viewportHeight} reducedMotion={reducedMotion} scrollMotion={scrollMotion} launchMotion={launchMotion} loaderLayout={{ ...loaderLayout, centerY: loaderLayout.centerY - insets.top }} onTextureProgress={setTextureProgress} onSelect={selectService} onInteract={pauseOnDrag} onInteractEnd={resumeAfterDrag} onArrival={onArrival} onReady={onGlobeReady} onError={onGlobeError} suspended={!active || cityVisible} />
           </GlobeStage>
-          <View pointerEvents="box-none" style={{ minHeight: pageHeight }}>
+          <Animated.View pointerEvents="box-none" style={{ opacity: launchReveal.interpolate({ inputRange: [0, 0.3, 0.8, 1], outputRange: [0, 0, 1, 1], extrapolate: `clamp` }) }}>
+          <View testID="landing-hero" pointerEvents="box-none" onLayout={event => measureSection(`hero`, event)} style={{ minHeight: pageHeight }}>
             {mapService && <Animated.View style={[styles.background, { opacity: mapOpacity, pointerEvents: cityVisible ? `auto` : `none` }]}>
               <CityView key={attempt} service={mapService} reveal={cityVisible} reducedMotion={reducedMotion} onReady={onMapReady} onError={onMapError} />
             </Animated.View>}
             <LinearGradient colors={[`rgba(3,8,18,0.94)`, `rgba(3,8,18,0.82)`, `rgba(3,8,18,0)`]} locations={[0, 0.66, 1]} style={[styles.topShade, { height: 660, opacity: selected ? 1 : 0.35 }]} />
 
             <View style={[styles.header, { paddingTop: compact ? 18 : 25, paddingHorizontal: compact ? 24 : 56 }]}>
-              <Pressable onPress={reset} accessibilityRole="button" accessibilityLabel="GeoCorp. Return to orbit" style={styles.brand}>
-                <Image source={logo} style={styles.logo} /><Text style={styles.wordmark}>geocorp<Text style={styles.wordmarkPeriod}>.</Text></Text>
+              <Pressable ref={headerBrand} testID="header-brand" onLayout={measureBrand} onPress={reset} accessibilityRole="button" accessibilityLabel="GeoCorp. Return to orbit" style={[styles.brand, { opacity: entered ? 1 : 0 }]}>
+                <GeoBrand onLoadEnd={onBrandReady} />
               </Pressable>
               {!compact && <Text style={styles.headerLabel}>INDEPENDENT THINKING. GLOBAL PERSPECTIVE.</Text>}
               <Pressable onPress={selected ? reset : () => selectService(services[0])} accessibilityRole="button" style={styles.headerButton}>
@@ -258,11 +304,25 @@ const GeoCorp = () => {
               </Pressable>}
             </View>
           </View>
-          {(!selected || returningToTop) && <PerspectiveSection compact={compact} pageHeight={pageHeight} progress={scrollY} reducedMotion={reducedMotion} revealed={!selected && (storyRevealed || reducedMotion)} onSelect={selectService} />}
+          {(!selected || returningToTop) && <View pointerEvents={selected ? `none` : `box-none`} accessibilityElementsHidden={Boolean(selected)} importantForAccessibility={selected ? `no-hide-descendants` : `auto`} aria-hidden={Boolean(selected)}>
+            <View pointerEvents="box-none" onLayout={event => measureSection(`perspectives`, event)}>
+              <PerspectiveSection compact={compact} pageHeight={pageHeight} progress={scrollY} reducedMotion={reducedMotion} revealed={!selected && (storyRevealed || reducedMotion)} onSelect={selectService} />
+            </View>
+            <View pointerEvents="box-none" onLayout={event => measureSection(`approach`, event)}>
+              <ApproachSection compact={compact} pageHeight={pageHeight} progress={scrollY} reducedMotion={reducedMotion} start={approachStart} onSelect={selectService} />
+            </View>
+            <View pointerEvents="box-none" onLayout={event => measureSection(`network`, event)}>
+              <NetworkSection compact={compact} pageHeight={pageHeight} progress={scrollY} reducedMotion={reducedMotion} start={networkStart} onSelect={selectService} />
+            </View>
+            <View pointerEvents="box-none" onLayout={event => measureSection(`footer`, event)}>
+              <LandingFooter compact={compact} pageHeight={pageHeight} viewportHeight={viewportHeight} progress={scrollY} reducedMotion={reducedMotion} start={footerStart} onSelect={selectService} onBackToTop={reset} onExplore={explorePerspectives} />
+            </View>
+          </View>}
+          </Animated.View>
         </View>
       </Animated.ScrollView>
-      {entered && !cityVisible && <Text style={[styles.attribution, { bottom: 10 + insets.bottom }]} accessibilityRole="link" onPress={() => void Linking.openURL(`https://www.solarsystemscope.com/textures/`)}>Earth: Solar System Scope · CC BY 4.0</Text>}
-      {!entered && <WorldLoader ready={Boolean((fontsLoaded || fontError) && (globeReady || globeError))} reducedMotion={reducedMotion} active={active} onComplete={onEntered} />}
+      {entered && !cityVisible && !globeError && <Text style={[styles.attribution, { bottom: 10 + insets.bottom }]} accessibilityRole="link" onPress={() => void Linking.openURL(`https://www.solarsystemscope.com/textures/`)}>Earth: Solar System Scope · CC BY 4.0</Text>}
+      {!entered && <WorldLoader progress={launchProgress} ready={Boolean(brandReady && (fontsLoaded || fontError) && (globeReady || globeError))} brandTarget={brandTarget} launchMotion={launchMotion} reveal={launchReveal} reducedMotion={reducedMotion} active={active} onComplete={onEntered} />}
     </View>
   );
 };
@@ -278,8 +338,6 @@ const styles = StyleSheet.create({
   topShade: { position: `absolute`, top: 0, left: 0, right: 0, pointerEvents: `none` },
   header: { zIndex: 3, gap: 20, flexDirection: `row`, alignItems: `center`, justifyContent: `space-between`, backgroundColor: `transparent` },
   brand: { gap: 8, flexDirection: `row`, alignItems: `center` },
-  logo: { width: 44, height: 44, borderRadius: 22 },
-  wordmark: { fontSize: 28, letterSpacing: -1.3, color: palette.text, fontFamily: `Manrope_800ExtraBold` },
   wordmarkPeriod: { color: palette.cyan },
   headerLabel: { fontSize: 12, letterSpacing: 1.1, color: palette.muted, fontFamily: `Manrope_500Medium` },
   headerButton: { gap: 17, minHeight: 44, flexDirection: `row`, alignItems: `center` },
